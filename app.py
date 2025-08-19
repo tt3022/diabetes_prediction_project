@@ -1,12 +1,14 @@
 # app.py
 # =============================================================
-# Diabetes Dashboard (EDA) + Prediction (Streamlit)
-# - EDA: Matplotlib + Seaborn；固定数据源：diabetes_prediction_project.csv
-# - Prediction: 读取你打包保存的 best_model.pkl（artifact 字典），
-#               与训练一致的预处理（去重、去除 gender=Other、独热、构造项、数值标准化）。
-# 兼容 Python 3.9
-# 运行：streamlit run app.py
-# 需要：best_model.pkl（必需）；可选 preprocessor.pkl、feature_list.json
+# Diabetes: Home + EDA Dashboard (Plotly) + Prediction (Streamlit)
+# - UI: English only
+# - EDA: fixed file "diabetes_prediction_project.csv" + SHAP images (single-column)
+# - Plots: Plotly (smaller size) with brief conclusions
+# - Prediction: loads an artifact dict from best_model.pkl
+#   {model, threshold, feature_order, numeric_feats, scaler, ...}
+#   UI labels are friendly (no underscores). "No Info" -> "Prefer not to say".
+# Python 3.9 compatible.
+# Run: streamlit run app.py
 # =============================================================
 
 import os
@@ -17,44 +19,52 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 from sklearn.preprocessing import StandardScaler
+import plotly.express as px
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-st.set_page_config(page_title="Diabetes: Dashboard & Prediction", layout="wide")
-sns.set(style="whitegrid")
+st.set_page_config(page_title="Diabetes App", layout="wide")
 
 # ---------------------------
-# 常量
+# Paths & constants
 # ---------------------------
 RAW_DATA_PATH = "diabetes_prediction_project.csv"
-MODEL_PATH = "best_model.pkl"
-SCALER_PATH = "preprocessor.pkl"        # 训练时用的 StandardScaler（可选，如提供则覆盖artifact内的scaler）
-FEATURES_PATH = "feature_list.json"     # 训练时特征顺序（可选）
+MODEL_PATH    = "best_model.pkl"
+SCALER_PATH   = "preprocessor.pkl"     # optional: overrides artifact scaler if present
+FEATURES_PATH = "feature_list.json"    # optional: feature order from training
 
-# 训练中使用的类别（保持一致）
-SMOKING_CATEGORIES = ["never", "former", "current", "ever", "not current", "No Info"]
-GENDER_CATEGORIES = ["Female", "Male"]  # 训练中已去掉 'Other'
+# SHAP images generated offline by your training notebook
+SHAP_BAR_PATH   = "shap_feature_importance.png"
+SHAP_SWARM_PATH = "shap_summary_beeswarm.png"
+
+# Categories used by the MODEL (must match training)
+SMOKING_CATS_MODEL = ["never", "former", "current", "ever", "not current", "No Info"]
+GENDER_CATS_MODEL  = ["Female", "Male"]  # "Other" removed at training time
+
+# UI-friendly options (mapped back to model vocab)
+SMOKING_CATS_UI = ["never", "former", "current", "ever", "not current", "Prefer not to say"]
+UI_TO_MODEL_SMOKE = {**{x: x for x in SMOKING_CATS_MODEL if x != "No Info"},
+                     "Prefer not to say": "No Info"}
+
+# Default plot size (smaller)
+PLOT_W, PLOT_H = 680, 380
 
 # ---------------------------
-# 工具函数
+# Utilities
 # ---------------------------
-def ensure_exists(path: str) -> bool:
+def exists(path: str) -> bool:
     return os.path.exists(path)
 
 @st.cache_resource(show_spinner=False)
-def load_model(path: str):
-    return joblib.load(path) if ensure_exists(path) else None
+def load_artifact(path: str):
+    return joblib.load(path) if exists(path) else None
 
 @st.cache_resource(show_spinner=False)
 def load_scaler(path: str) -> Optional[StandardScaler]:
-    return joblib.load(path) if ensure_exists(path) else None
+    return joblib.load(path) if exists(path) else None
 
 @st.cache_data(show_spinner=False)
 def load_feature_list(path: str) -> Optional[List[str]]:
-    if ensure_exists(path):
+    if exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict) and "features" in data:
@@ -64,228 +74,256 @@ def load_feature_list(path: str) -> Optional[List[str]]:
     return None
 
 @st.cache_data(show_spinner=False)
-def load_raw_data() -> pd.DataFrame:
-    return pd.read_csv(RAW_DATA_PATH) if ensure_exists(RAW_DATA_PATH) else pd.DataFrame()
+def load_raw_df() -> pd.DataFrame:
+    return pd.read_csv(RAW_DATA_PATH) if exists(RAW_DATA_PATH) else pd.DataFrame()
 
-def training_like_preprocess(
+def preprocess_like_training(
     df_raw: pd.DataFrame,
     scaler: Optional[StandardScaler] = None,
     numeric_feats_override: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    复现训练时预处理（用于建模/预测）：
-      1) drop_duplicates；去掉 gender=='Other'
-      2) 对 gender、smoking_history 进行独热编码（drop_first=True）
-      3) 构造 comorbidity_count, age_bmi_interaction
-      4) 标准化数值列（使用已fit的 scaler）
-    说明：为 EDA 展示保留 _raw_gender/_raw_smoking_history（仅用于图表分组/着色）
+    Reproduce training preprocessing:
+      1) drop_duplicates; remove gender=='Other'
+      2) one-hot encode gender & smoking_history (drop_first=True) with fixed categories
+      3) feature engineering: comorbidity_count, age_bmi_interaction
+      4) standardize numeric features with provided (fitted) scaler
+    Additionally keep _raw_gender/_raw_smoking_history for EDA readability.
     """
     df = df_raw.copy()
 
-    # 去掉 Other 并去重
     if "gender" in df.columns:
         df = df[df["gender"] != "Other"]
     df = df.drop_duplicates()
 
-    # 保留原始分类列供 EDA 使用
+    # keep raw categorical columns for EDA
     df["_raw_gender"] = df.get("gender", pd.Series(index=df.index, dtype=object))
     df["_raw_smoking_history"] = df.get("smoking_history", pd.Series(index=df.index, dtype=object))
 
-    # 固定类别，保证 dummy 列稳定
+    # lock categories for stable dummies
     if "gender" in df.columns:
-        df["gender"] = pd.Categorical(df["gender"], categories=GENDER_CATEGORIES + ["Other"], ordered=False)
+        df["gender"] = pd.Categorical(df["gender"], categories=GENDER_CATS_MODEL + ["Other"], ordered=False)
     if "smoking_history" in df.columns:
-        df["smoking_history"] = pd.Categorical(df["smoking_history"], categories=SMOKING_CATEGORIES, ordered=False)
+        # map UI label back to model vocab if needed (single-row prediction use-case)
+        df["smoking_history"] = df["smoking_history"].map(lambda v: UI_TO_MODEL_SMOKE.get(v, v))
+        df["smoking_history"] = pd.Categorical(df["smoking_history"], categories=SMOKING_CATS_MODEL, ordered=False)
 
-    # 独热编码（与训练一致 drop_first=True）
+    # dummies (drop_first=True as in training)
     dmy_cols = [c for c in ["gender", "smoking_history"] if c in df.columns]
     if dmy_cols:
         df = pd.get_dummies(df, columns=dmy_cols, drop_first=True)
 
-    # 构造特征
+    # engineered features
     if set(["hypertension", "heart_disease"]).issubset(df.columns):
         df["comorbidity_count"] = df["hypertension"].astype(float) + df["heart_disease"].astype(float)
     if set(["age", "bmi"]).issubset(df.columns):
         df["age_bmi_interaction"] = df["age"].astype(float) * df["bmi"].astype(float)
 
-    # —— 数值列：优先用 artifact 里保存的 numeric_feats —— #
+    # numeric features to scale
     if numeric_feats_override is not None:
-        numeric_feats = [c for c in numeric_feats_override if c in df.columns]
+        num_feats = [c for c in numeric_feats_override if c in df.columns]
     else:
-        numeric_feats = [c for c in ["age", "bmi", "HbA1c_level", "blood_glucose_level", "age_bmi_interaction"] if c in df.columns]
+        num_feats = [c for c in ["age","bmi","HbA1c_level","blood_glucose_level","age_bmi_interaction"] if c in df.columns]
 
-    # 标准化（若提供了训练时已 fit 的 scaler）
-    if scaler is not None and numeric_feats:
-        df.loc[:, numeric_feats] = scaler.transform(df[numeric_feats])
+    if scaler is not None and num_feats:
+        df.loc[:, num_feats] = scaler.transform(df[num_feats])
 
     return df
 
-def align_features_for_model(X_df: pd.DataFrame, model, feature_list: Optional[List[str]]) -> pd.DataFrame:
-    """将列对齐到模型期望的顺序与集合。缺失列补 0，多余列丢弃。"""
-    expected: Optional[List[str]] = None
+def align_to_model(X: pd.DataFrame, model, feature_list: Optional[List[str]]) -> pd.DataFrame:
+    expected = None
     if feature_list:
         expected = list(feature_list)
     elif hasattr(model, "feature_names_in_"):
         expected = list(model.feature_names_in_)
-    return X_df.reindex(columns=expected, fill_value=0) if expected is not None else X_df
+    return X.reindex(columns=expected, fill_value=0) if expected is not None else X
 
-def seaborn_to_streamlit(fig):
-    st.pyplot(fig, clear_figure=True)
+def px_show(fig):
+    fig.update_layout(width=PLOT_W, height=PLOT_H, margin=dict(l=30, r=20, t=50, b=35))
+    st.plotly_chart(fig, use_container_width=False)
 
 # ---------------------------
-# 页面导航
+# Navigation
 # ---------------------------
-st.sidebar.title("导航")
-page = st.sidebar.radio("选择模块", ["Dashboard (EDA)", "Prediction"], index=0)
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["Home", "EDA Dashboard", "Prediction"], index=0)
 
 # ===========================
-# Dashboard (EDA)
+# Home
 # ===========================
-if page == "Dashboard (EDA)":
-    st.title("📊 Dashboard：EDA（Matplotlib & Seaborn）")
+if page == "Home":
+    st.title("Diabetes Risk — Interactive App")
+    st.markdown(
+        """
+**Welcome!**
 
-    df_raw = load_raw_data()
+This app includes:
+1. **EDA Dashboard** — interactive Plotly charts (distributions, risk-factor rates, correlation heatmap, two-feature scatter).
+2. **Prediction** — enter personal health information to get a diabetes risk estimate (probability + class).
+
+**Data**: the app reads a fixed file `diabetes_prediction_project.csv` placed next to `app.py`.  
+**Model**: `best_model.pkl` is an artifact dict containing the trained model and metadata.
+
+*Tip:* Keep preprocessing identical to training for reliable predictions.
+"""
+    )
+
+# ===========================
+# EDA Dashboard (Plotly)
+# ===========================
+elif page == "EDA Dashboard":
+    st.title("EDA Dashboard")
+
+    df_raw = load_raw_df()
     if df_raw.empty:
-        st.error(f"未找到固定数据文件：{RAW_DATA_PATH}。请将其与 app.py 放在同一目录。")
+        st.error(f"Data file not found: `{RAW_DATA_PATH}`. Place it next to app.py.")
         st.stop()
 
-    # 仅用于展示：不做数值标准化，保证可解释性
-    df_eda = training_like_preprocess(df_raw, scaler=None, numeric_feats_override=None)
+    # For interpretability we do NOT scale numerics for EDA
+    df_eda = preprocess_like_training(df_raw, scaler=None, numeric_feats_override=None)
 
-    st.subheader("数据预览")
+    st.subheader("Preview")
     st.dataframe(df_raw.head())
 
-    # 变量选择
-    numeric_cols_all = df_eda.select_dtypes(include=[np.number]).columns.tolist()
-    # 用原始分类列做着色/分组，读起来更直观
-    cat_candidates = []
-    if "_raw_gender" in df_eda.columns: cat_candidates.append("_raw_gender")
-    if "_raw_smoking_history" in df_eda.columns: cat_candidates.append("_raw_smoking_history")
-    for c in ["hypertension", "heart_disease"]:
-        if c in df_eda.columns: cat_candidates.append(c)
-
-    st.sidebar.markdown("### 变量选择")
-    sel_num = st.sidebar.multiselect(
-        "数值变量（用于热力图/散点）",
-        options=sorted([c for c in numeric_cols_all if c != "diabetes"]),
-        default=[c for c in ["age", "bmi", "HbA1c_level", "blood_glucose_level"] if c in numeric_cols_all]
-    )
-    color_key = st.sidebar.selectbox(
-        "分类变量（用于上色，可选）",
-        options=["(无)"] + cat_candidates,
-        index=0
-    )
-    color_key = None if color_key == "(无)" else color_key  # 目前主要在散点图用 hue=diabetes，上色更清晰
-
-    # ---- 各特征与糖尿病的关系：bmi/HbA1c/glucose vs diabetes（小提琴图） ----
-    st.subheader("各特征与糖尿病的关系")
+    # ---------- Distributions: violin ----------
+    st.subheader("Feature distributions by diabetes (violin)")
     if "diabetes" in df_eda.columns:
-        for col in [c for c in ["bmi", "HbA1c_level", "blood_glucose_level"] if c in df_eda.columns]:
-            fig, ax = plt.subplots(figsize=(7, 4.5))
-            sns.violinplot(data=df_eda, x="diabetes", y=col, inner="quartile", ax=ax)
-            ax.set_title(f"{col} vs diabetes")
-            ax.set_xlabel("diabetes（0=否, 1=是）")
-            ax.set_ylabel(col)
-            seaborn_to_streamlit(fig)
-    else:
-        st.info("缺少 `diabetes` 列，无法绘制小提琴图。")
+        for col in [c for c in ["bmi","HbA1c_level","blood_glucose_level"] if c in df_eda.columns]:
+            fig = px.violin(df_eda, x="diabetes", y=col, box=True, points=False)
+            fig.update_layout(title=f"{col} vs diabetes")
+            px_show(fig)
+            g = df_eda.groupby("diabetes")[col].mean().to_dict()
+            g0 = g.get(0, np.nan); g1 = g.get(1, np.nan)
+            st.caption(f"Conclusion: mean {col} ≈ {g1:.2f} (diabetes=1) vs {g0:.2f} (diabetes=0).")
 
-    # ---- age vs diabetes：直方 + KDE ----
+    # ---------- Age histogram ----------
     if "diabetes" in df_eda.columns and "age" in df_eda.columns:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        sns.histplot(data=df_eda, x="age", hue="diabetes", multiple="stack", bins=30, kde=True, ax=ax)
-        ax.set_title("Age Distribution by diabetes")
-        seaborn_to_streamlit(fig)
+        st.subheader("Age distribution by diabetes")
+        fig = px.histogram(df_eda, x="age", color="diabetes", barmode="overlay", nbins=30, opacity=0.65)
+        fig.update_layout(title="Age distribution (overlay)")
+        px_show(fig)
+        g = df_eda.groupby("diabetes")["age"].mean().to_dict()
+        st.caption(f"Conclusion: average age tends to be higher for diabetes=1 "
+                   f"({g.get(1, np.nan):.1f}) than for diabetes=0 ({g.get(0, np.nan):.1f}).")
 
-    # ---- 风险因素柱状图：患病率 ----
-    st.subheader("风险因素与糖尿病患病率")
+    # ---------- Risk-factor bars ----------
+    st.subheader("Diabetes rate by risk factors")
     for col in ["hypertension", "heart_disease", "_raw_smoking_history"]:
         if col in df_eda.columns and "diabetes" in df_eda.columns:
-            tmp = df_eda[[col, "diabetes"]].copy()
+            temp = df_eda[[col,"diabetes"]].copy()
             if col == "_raw_smoking_history":
-                tmp[col] = tmp[col].astype(str)
-            rate_df = tmp.groupby(col, dropna=False)["diabetes"].mean().reset_index()
-            fig, ax = plt.subplots(figsize=(7.5, 4.5))
-            sns.barplot(data=rate_df, x=col, y="diabetes", ax=ax)
-            ax.set_ylim(0, 1)
-            ax.set_ylabel("糖尿病患病率")
-            ax.set_title(f"Diabetes Rate by {col.replace('_raw_', '')}")
-            plt.xticks(rotation=20, ha="right")
-            seaborn_to_streamlit(fig)
+                temp[col] = temp[col].astype(str).replace({"No Info": "Prefer not to say"})
+            rate = temp.groupby(col, dropna=False)["diabetes"].mean().reset_index()
+            rate["diabetes"] = rate["diabetes"].astype(float)
+            fig = px.bar(rate, x=col, y="diabetes", text="diabetes", range_y=[0,1])
+            fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+            fig.update_layout(title=f"Diabetes rate by {col.replace('_raw_', '')}")
+            px_show(fig)
 
-    # ---- 数值特征相关性热力图 ----
-    st.subheader("数值特征相关性热力图")
-    if len(sel_num) >= 2:
-        corr = df_eda[sel_num].corr(numeric_only=True)
-        fig, ax = plt.subplots(figsize=(1.2 * len(sel_num) + 3, 0.9 * len(sel_num) + 3))
-        sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", linewidths=0.5, ax=ax)
-        ax.set_title("Correlation Heatmap")
-        seaborn_to_streamlit(fig)
+    # ---------- Variable importance (SHAP) — single column, no downloads ----------
+    st.subheader("Variable importance (SHAP)")
+    if not exists(SHAP_BAR_PATH) and not exists(SHAP_SWARM_PATH):
+        st.info(
+            "SHAP images not found. Generate them in your training notebook and save as "
+            f"`{SHAP_BAR_PATH}` and `{SHAP_SWARM_PATH}` in the same folder as app.py."
+        )
     else:
-        st.info("请选择至少两个数值变量以绘制热力图。")
+        if exists(SHAP_BAR_PATH):
+            st.markdown("**Feature importance (mean |SHAP|)**")
+            st.image(SHAP_BAR_PATH, use_container_width=True)
+            st.caption("Conclusion: HbA1c and blood glucose dominate overall importance; "
+                       "interaction and comorbidities also contribute.")
+        if exists(SHAP_SWARM_PATH):
+            st.markdown("**SHAP summary (beeswarm)**")
+            st.image(SHAP_SWARM_PATH, use_container_width=True)
+            st.caption("Conclusion: the spread shows how feature values push predictions up or down per sample.")
 
-    # ---- 两个数值特征散点（按 diabetes 上色）----
-    st.subheader("两个数值特征散点图（按 diabetes 上色）")
+    # ---------- Correlation heatmap (selector right beside) ----------
+    st.subheader("Correlation heatmap")
+    numeric_cols = df_eda.select_dtypes(include=[np.number]).columns.tolist()
+    default_pick = [c for c in ["age","bmi","HbA1c_level","blood_glucose_level"] if c in numeric_cols]
+    left, right = st.columns([1, 3])
+    with left:
+        sel_num = st.multiselect(
+            "Numeric features for heatmap / scatter",
+            options=[c for c in numeric_cols if c != "diabetes"],
+            default=default_pick
+        )
+    with right:
+        if len(sel_num) >= 2:
+            corr = df_eda[sel_num].corr(numeric_only=True)
+            fig = px.imshow(corr, text_auto=".2f", aspect="auto",
+                            color_continuous_scale="RdBu_r", origin="lower")
+            fig.update_layout(title="Correlation heatmap")
+            px_show(fig)
+
+            corr_vals = corr.abs().stack()
+            corr_vals = corr_vals[corr_vals < 0.999]
+            if not corr_vals.empty:
+                pair = corr_vals.idxmax()
+                val  = corr_vals.max()
+                st.caption(f"Conclusion: strongest absolute correlation is between **{pair[0]}** and **{pair[1]}** (|r|≈{val:.2f}).")
+        else:
+            st.info("Select at least two numeric features to render the heatmap.")
+
+    # ---------- Scatter uses the SAME sel_num ----------
+    st.subheader("Two-feature scatter (colored by diabetes)")
     if len(sel_num) >= 2 and "diabetes" in df_eda.columns:
         c1, c2 = st.columns(2)
         with c1:
-            x_feat = st.selectbox("X 轴特征", options=sel_num, index=0, key="xfeat")
+            x_feat = st.selectbox("X axis", options=sel_num, index=0, key="xfeat")
         with c2:
-            y_feat = st.selectbox("Y 轴特征", options=[c for c in sel_num if c != x_feat], index=0, key="yfeat")
-        fig, ax = plt.subplots(figsize=(7, 5))
-        sns.scatterplot(data=df_eda, x=x_feat, y=y_feat, hue="diabetes", alpha=0.6, ax=ax)
-        ax.set_title(f"{x_feat} vs {y_feat}")
-        seaborn_to_streamlit(fig)
+            y_feat = st.selectbox("Y axis", options=[c for c in sel_num if c != x_feat], index=0, key="yfeat")
+        fig = px.scatter(df_eda, x=x_feat, y=y_feat, color="diabetes", opacity=0.7)
+        fig.update_layout(title=f"{x_feat} vs {y_feat}")
+        px_show(fig)
+        st.caption("Conclusion: look for separation between diabetes classes along the two features.")
     else:
-        st.info("需要选择至少两个数值变量，且数据包含 `diabetes` 列。")
+        st.info("Pick two numeric features and ensure `diabetes` exists.")
 
 # ===========================
 # Prediction
 # ===========================
 else:
-    st.title("🧮 Prediction：糖尿病风险预测")
+    st.title("Prediction")
 
-    # 载入 artifact（可能是 dict，也可能直接是模型/Pipeline）
-    loaded = load_model(MODEL_PATH)
+    loaded = load_artifact(MODEL_PATH)
     if loaded is None:
-        st.error(f"未找到模型文件：{MODEL_PATH}。")
+        st.error(f"Model artifact not found: `{MODEL_PATH}`.")
         st.stop()
 
-    # 默认值
     model = loaded
     threshold = None
-    feature_list = load_feature_list(FEATURES_PATH)  # 可选的外部 json
-    artifact_scaler = None
-    artifact_numeric = None
+    feature_order = load_feature_list(FEATURES_PATH)   # optional external list
+    art_scaler = None
+    art_numeric = None
 
-    # 如果是保存的 dict，就解包
     if isinstance(loaded, dict):
-        model = loaded.get("model", None)
-        threshold = loaded.get("threshold", None)
-        feature_list = loaded.get("feature_order", feature_list)
-        artifact_scaler = loaded.get("scaler", None)
-        artifact_numeric = loaded.get("numeric_feats", None)
+        model         = loaded.get("model", None)
+        threshold     = loaded.get("threshold", None)
+        feature_order = loaded.get("feature_order", feature_order)
+        art_scaler    = loaded.get("scaler", None)
+        art_numeric   = loaded.get("numeric_feats", None)
 
-    # 外部 preprocessor.pkl 优先级更高：如果提供了，就覆盖 artifact 里的 scaler
-    scaler = load_scaler(SCALER_PATH) or artifact_scaler
+    scaler = load_scaler(SCALER_PATH) or art_scaler
 
     if model is None:
-        st.error("artifact 中未找到 'model'。请检查 best_model.pkl 的内容。")
+        st.error("`model` not found inside artifact. Please check best_model.pkl.")
         st.stop()
 
-    # —— 侧边栏输入（性别仅 Female/Male）—— #
-    st.sidebar.header("输入个人健康信息")
-    age = st.sidebar.number_input("age（年龄）", min_value=0, max_value=120, value=40, step=1)
-    gender = st.sidebar.selectbox("gender（性别）", options=GENDER_CATEGORIES, index=1)  # 仅 Female/Male
-    bmi = st.sidebar.number_input("bmi（体重指数）", min_value=10.0, max_value=70.0, value=27.5, step=0.1, format="%.1f")
-    hba1c = st.sidebar.number_input("HbA1c_level（%）", min_value=3.0, max_value=20.0, value=6.5, step=0.1, format="%.1f")
-    glucose = st.sidebar.number_input("blood_glucose_level（mg/dL）", min_value=40.0, max_value=500.0, value=120.0, step=1.0, format="%.1f")
-    hypertension = st.sidebar.selectbox("hypertension（高血压史）", options=["No", "Yes"], index=0)
-    heart_disease = st.sidebar.selectbox("heart_disease（心脏病史）", options=["No", "Yes"], index=0)
-    smoking_history = st.sidebar.selectbox("smoking_history（吸烟史）", options=SMOKING_CATEGORIES, index=0)
+    # Inputs (friendly labels; no underscores; no 'Other' for gender)
+    st.sidebar.header("Input")
+    age = st.sidebar.number_input("Age", min_value=0, max_value=120, value=40, step=1)
+    gender = st.sidebar.selectbox("Gender", options=GENDER_CATS_MODEL, index=1)
+    bmi = st.sidebar.number_input("BMI", min_value=10.0, max_value=70.0, value=27.5, step=0.1, format="%.1f")
+    hba1c = st.sidebar.number_input("HbA1c (%)", min_value=3.0, max_value=20.0, value=6.5, step=0.1, format="%.1f")
+    glucose = st.sidebar.number_input("Blood Glucose (mg/dL)", min_value=40.0, max_value=500.0, value=120.0, step=1.0, format="%.1f")
+    hypertension = st.sidebar.selectbox("Hypertension", options=["No", "Yes"], index=0)
+    heart_disease = st.sidebar.selectbox("Heart Disease", options=["No", "Yes"], index=0)
+    smoking_history_ui = st.sidebar.selectbox("Smoking History", options=SMOKING_CATS_UI, index=0)
+    smoking_history_model = UI_TO_MODEL_SMOKE.get(smoking_history_ui, smoking_history_ui)
 
-    # 原始输入
-    input_df_raw = pd.DataFrame([{
+    input_raw = pd.DataFrame([{
         "age": age,
         "gender": gender,
         "bmi": bmi,
@@ -293,61 +331,42 @@ else:
         "blood_glucose_level": glucose,
         "hypertension": 1 if hypertension == "Yes" else 0,
         "heart_disease": 1 if heart_disease == "Yes" else 0,
-        "smoking_history": smoking_history
+        "smoking_history": smoking_history_model
     }])
 
-    st.markdown("**输入数据（原始）**")
-    st.dataframe(input_df_raw)
+    st.markdown("**Raw input (training column names)**")
+    st.dataframe(input_raw)
 
-    if st.button("开始预测", type="primary"):
+    if st.button("Predict", type="primary"):
         try:
-            # 如果模型是完整 Pipeline，让它自己处理；否则按训练流程预处理
             pipeline_like = hasattr(model, "predict") and (hasattr(model, "named_steps") or hasattr(model, "transform"))
             if pipeline_like and scaler is None:
-                X_in = input_df_raw.copy()
+                X_in = input_raw.copy()
             else:
-                X_tmp = training_like_preprocess(
-                    input_df_raw,
-                    scaler=scaler,
-                    numeric_feats_override=artifact_numeric
-                )
-                # 去掉仅用于 EDA 的保留列
-                for h in ["_raw_gender", "_raw_smoking_history"]:
+                X_tmp = preprocess_like_training(input_raw, scaler=scaler, numeric_feats_override=art_numeric)
+                for h in ["_raw_gender","_raw_smoking_history"]:
                     if h in X_tmp.columns:
                         X_tmp = X_tmp.drop(columns=[h])
-                # 对齐模型特征
-                X_in = align_features_for_model(X_tmp, model, feature_list)
+                X_in = align_to_model(X_tmp, model, feature_order)
 
-            # 概率 & 阈值
             proba = model.predict_proba(X_in)[:, 1] if hasattr(model, "predict_proba") else None
-
-            # 若有 threshold，用它出标签；否则退回 model.predict
             if proba is not None and threshold is not None:
                 pred = (proba >= float(threshold)).astype(int)
             else:
                 pred = model.predict(X_in)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("预测类别（是否糖尿病）", "是" if int(pred[0]) == 1 else "否")
-            with col2:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Prediction (diabetes)", "Yes" if int(pred[0]) == 1 else "No")
+            with c2:
                 if proba is not None:
-                    st.metric("预测概率（阳性类）", f"{float(proba[0]) * 100:.1f}%")
+                    st.metric("Probability (positive class)", f"{float(proba[0])*100:.1f}%")
                 else:
-                    st.info("当前模型不支持 predict_proba，已显示类别预测。")
+                    st.info("Current model has no predict_proba; showing class only.")
 
-            with st.expander("调试信息（可折叠）", expanded=False):
-                st.write("模型类型：", type(model))
-                st.write("使用的阈值（如有）：", threshold)
-                if feature_list:
-                    st.write("特征顺序：", feature_list)
-                elif hasattr(model, "feature_names_in_"):
-                    st.write("特征顺序（model.feature_names_in_）：", list(model.feature_names_in_))
-                st.write("用于预测的特征列：", list(X_in.columns))
+            if threshold is not None and proba is not None:
+                st.caption(f"Conclusion: classification used your saved threshold = {float(threshold):.3f}.")
 
         except Exception as e:
             st.exception(e)
-            st.error("预测过程中出现错误。请检查模型/预处理与特征名是否一致。")
-
-# Footer
-st.caption("© 2025 Diabetes App — Streamlit")
+            st.error("Prediction failed. Please verify model, preprocessing and feature names.")
