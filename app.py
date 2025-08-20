@@ -3,11 +3,10 @@
 # Diabetes: Home + EDA Dashboard (Plotly) + Prediction (Streamlit)
 # - UI: English only
 # - EDA: fixed file "diabetes_prediction_project.csv" + SHAP images (single-column)
-# - Plots: Plotly (smaller size) with brief conclusions
+# - Plots: Plotly (compact) with brief conclusions
 # - Prediction: loads an artifact dict from best_model.pkl
-#   {model, threshold, feature_order, numeric_feats, scaler, ...}
-#   UI labels are friendly (no underscores). "No Info" -> "Prefer not to say".
-# Python 3.9 compatible.
+#   {model (XGBoost), threshold, feature_order, numeric_feats, scaler, ...}
+# - Python 3.9+ compatible.
 # Run: streamlit run app.py
 # =============================================================
 
@@ -45,7 +44,7 @@ SMOKING_CATS_UI = ["never", "former", "current", "ever", "not current", "Prefer 
 UI_TO_MODEL_SMOKE = {**{x: x for x in SMOKING_CATS_MODEL if x != "No Info"},
                      "Prefer not to say": "No Info"}
 
-# Default plot size (smaller)
+# Default plot size for Plotly charts
 PLOT_W, PLOT_H = 680, 380
 
 # ---------------------------
@@ -104,7 +103,6 @@ def preprocess_like_training(
     if "gender" in df.columns:
         df["gender"] = pd.Categorical(df["gender"], categories=GENDER_CATS_MODEL + ["Other"], ordered=False)
     if "smoking_history" in df.columns:
-        # map UI label back to model vocab if needed (single-row prediction use-case)
         df["smoking_history"] = df["smoking_history"].map(lambda v: UI_TO_MODEL_SMOKE.get(v, v))
         df["smoking_history"] = pd.Categorical(df["smoking_history"], categories=SMOKING_CATS_MODEL, ordered=False)
 
@@ -161,10 +159,20 @@ This app includes:
 1. **EDA Dashboard** — interactive Plotly charts (distributions, risk-factor rates, correlation heatmap, two-feature scatter).
 2. **Prediction** — enter personal health information to get a diabetes risk estimate (probability + class).
 
-**Data**: the app reads a fixed file `diabetes_prediction_project.csv` placed next to `app.py`.  
-**Model**: `best_model.pkl` is an artifact dict containing the trained model and metadata.
+---
 
-*Tip:* Keep preprocessing identical to training for reliable predictions.
+### 🔹 Data
+This app expects a dataset named **`diabetes_prediction_project.csv`** located **in the same folder as `app.py`**.
+- **Format:** CSV with patient attributes (e.g., `age`, `gender`, `bmi`, `HbA1c_level`, `blood_glucose_level`, `hypertension`, `heart_disease`, `smoking_history`, and the target `diabetes`).
+- **Usage:** Used for EDA in this app; during training the same schema was used to build the model.
+
+### 🔹 Model
+Predictions are powered by **`best_model.pkl`**, an artifact that contains:
+- A trained **XGBoost** classifier optimized for diabetes risk.
+- The **preprocessing details** identical to training (feature list, optional scaler, and category encoding).
+- Helpful metadata such as the **decision threshold** and the expected **feature order**.
+
+**Tip:** Keep preprocessing **identical** to training so the model receives features in the exact expected format.
 """
     )
 
@@ -220,12 +228,12 @@ elif page == "EDA Dashboard":
             fig.update_layout(title=f"Diabetes rate by {col.replace('_raw_', '')}")
             px_show(fig)
 
-    # ---------- Variable importance (SHAP) — single column, no downloads ----------
+    # ---------- Variable importance (SHAP) — single column ----------
     st.subheader("Variable importance (SHAP)")
     if not exists(SHAP_BAR_PATH) and not exists(SHAP_SWARM_PATH):
         st.info(
             "SHAP images not found. Generate them in your training notebook and save as "
-            f"`{SHAP_BAR_PATH}` and `{SHAP_SWARM_PATH}` in the same folder as app.py."
+            f"{SHAP_BAR_PATH} and {SHAP_SWARM_PATH} in the same folder as app.py."
         )
     else:
         if exists(SHAP_BAR_PATH):
@@ -238,7 +246,7 @@ elif page == "EDA Dashboard":
             st.image(SHAP_SWARM_PATH, use_container_width=True)
             st.caption("Conclusion: the spread shows how feature values push predictions up or down per sample.")
 
-    # ---------- Correlation heatmap (selector right beside) ----------
+    # ---------- Correlation heatmap ----------
     st.subheader("Correlation heatmap")
     numeric_cols = df_eda.select_dtypes(include=[np.number]).columns.tolist()
     default_pick = [c for c in ["age","bmi","HbA1c_level","blood_glucose_level"] if c in numeric_cols]
